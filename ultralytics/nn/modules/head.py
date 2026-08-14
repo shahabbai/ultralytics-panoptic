@@ -14,10 +14,11 @@ from torch.nn.init import constant_, xavier_uniform_
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
-from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN
+from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN, PanopticProto26
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
+
 
 __all__ = (
     "OBB",
@@ -1974,3 +1975,99 @@ class SemanticSegment(nn.Module):
                 return cls.to(torch.uint8 if self.nc <= 256 else torch.int32)
             return y
         return logits
+
+class PanopticSegment26(Segment26):
+    """
+    YOLO26 panoptic head.
+
+    Thing prediction:
+        existing Segment26 machinery
+
+    Stuff prediction:
+        shared prototype-based dense branch
+    """
+
+    def __init__(
+        self,
+        nc: int = 80,
+        n_stuff: int = 53,
+        nm: int = 32,
+        npr: int = 256,
+        reg_max: int = 1,
+        end2end: bool = True,
+        ch: tuple = (),
+    ):
+        # Build all normal YOLO26 instance segmentation heads.
+        super().__init__(
+            nc=nc,
+            nm=nm,
+            npr=npr,
+            reg_max=reg_max,
+            end2end=end2end,
+            ch=ch,
+        )
+
+        self.n_stuff = n_stuff
+        self.n_pan_sem = n_stuff + 1
+
+        # Replace original Proto26 with our shared panoptic prototype module.
+        self.proto = PanopticProto26(
+            ch=ch,
+            c_=self.npr,
+            nm=self.nm,
+            n_stuff=n_stuff,
+        )
+
+    def forward(self, x):
+        # Existing YOLO detection + mask-coefficient prediction.
+        outputs = Detect.forward(self, x)
+
+        preds = (
+            outputs[1]
+            if isinstance(outputs, tuple)
+            else outputs
+        )
+
+        proto, stuff_logits, aux_stuff = self.proto(x)
+
+        if isinstance(preds, dict):
+
+            # Keep semantic outputs at top level as well.
+            preds["stuff_logits"] = stuff_logits
+
+            if aux_stuff is not None:
+                preds["aux_stuff_logits"] = aux_stuff
+
+            if self.end2end:
+                # Dense branch: trains shared feature/prototype representation.
+                preds["one2many"]["proto"] = proto
+                preds["one2many"]["stuff_logits"] = stuff_logits
+
+                if aux_stuff is not None:
+                    preds["one2many"]["aux_stuff_logits"] = aux_stuff
+
+                # Deployment branch stays consistent with YOLO26 behavior.
+                preds["one2one"]["proto"] = proto.detach()
+
+            else:
+                preds["proto"] = proto
+
+        if self.training:
+            return preds
+
+        # For now preserve normal Segment26 predictor compatibility.
+        # Existing instance-segmentation code still sees (detections, proto).
+        if self.export:
+            # Do NOT rely on this yet.
+            # Export integration is Phase 2.
+            return outputs, proto, stuff_logits
+
+        return ((outputs[0], proto), preds)
+
+    def fuse(self):
+        # Removes one-to-many detection branch in E2E mode.
+        super().fuse()
+
+        # Our PanopticProto26.fuse() removes only the auxiliary head.
+        if hasattr(self.proto, "fuse"):
+            self.proto.fuse()

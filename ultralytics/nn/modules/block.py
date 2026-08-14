@@ -2073,3 +2073,97 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
+
+
+class PanopticProto26(Proto):
+    """
+    Shared prototype generator for panoptic YOLO26.
+
+    The same prototype tensor is used for:
+      1. thing-instance mask reconstruction
+      2. dense stuff/thing-gate prediction
+    """
+
+    def __init__(
+        self,
+        ch: tuple = (),
+        c_: int = 256,
+        nm: int = 32,
+        n_stuff: int = 53,
+    ):
+        super().__init__(c_, c_, nm)
+
+        self.nm = nm
+        self.n_stuff = n_stuff
+
+        # +1 = generic THING gate
+        self.n_pan_sem = n_stuff + 1
+
+        # P4/P5 -> P3 channel width
+        self.feat_refine = nn.ModuleList(
+            Conv(c, ch[0], k=1) for c in ch[1:]
+        )
+
+        # fused P3/P4/P5 feature -> prototype input
+        self.feat_fuse = Conv(ch[0], c_, k=3)
+
+        # IMPORTANT:
+        # direct linear combination of the SAME mask prototypes
+        #
+        # [B, nm, H/4, W/4]
+        #       ->
+        # [B, n_stuff+1, H/4, W/4]
+        self.stuff_head = nn.Conv2d(
+            nm,
+            self.n_pan_sem,
+            kernel_size=1,
+        )
+
+        # Training-only auxiliary semantic supervision.
+        # This follows the philosophy already used by YOLO26.
+        self.aux_stuff = nn.Sequential(
+            Conv(ch[0], c_, k=3),
+            nn.Conv2d(c_, self.n_pan_sem, 1),
+        )
+
+    def forward(self, x):
+        # x = [P3, P4, P5]
+        feat = x[0]
+
+        for i, refine in enumerate(self.feat_refine):
+            higher = refine(x[i + 1])
+
+            # P4 -> x2
+            # P5 -> x4
+            higher = F.interpolate(
+                higher,
+                scale_factor=2 ** (i + 1),
+                mode="nearest",
+            )
+
+            feat = feat + higher
+
+        # Shared prototype bank
+        proto = super().forward(
+            self.feat_fuse(feat)
+        )
+
+        # Stuff masks are themselves combinations
+        # of the prototype basis.
+        stuff_logits = self.stuff_head(proto)
+
+        # Training-only deep supervision.
+        aux_stuff = (
+            self.aux_stuff(feat)
+            if self.training and self.aux_stuff is not None
+            else None
+        )
+
+        return proto, stuff_logits, aux_stuff
+
+    def fuse(self):
+        """
+        Keep stuff_head at inference.
+        Remove only the training auxiliary branch.
+        """
+        self.aux_stuff = None

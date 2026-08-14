@@ -76,6 +76,7 @@ from ultralytics.nn.modules import (
     YOLOESegment,
     YOLOESegment26,
     v10Detect,
+    PanopticSegment26
 )
 from ultralytics.utils import (
     DEFAULT_CFG_DICT,
@@ -2119,6 +2120,23 @@ def parse_model(d, ch, verbose=True):
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        elif m is PanopticSegment26:
+            # YAML:
+            # [nc, n_stuff, nm, npr]
+
+            # Width-scale only npr, just like Segment26 scales its prototype width.
+            args[3] = make_divisible(
+                min(args[3], max_channels) * width,
+                8,
+            )
+
+            args.extend([
+                reg_max,
+                end2end,
+                [ch[x] for x in f],
+            ])
+
+            m.legacy = legacy    
         else:
             c2 = ch[f]
 

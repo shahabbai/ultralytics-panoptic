@@ -59,6 +59,7 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
+    PanopticProto26
 )
 from .conv import (
     CBAM,
@@ -94,6 +95,7 @@ from .head import (
     YOLOESegment,
     YOLOESegment26,
     v10Detect,
+    PanopticSegment26
 )
 from .transformer import (
     AIFI,
@@ -191,4 +193,7 @@ __all__ = (
     "YOLOESegment",
     "YOLOESegment26",
     "v10Detect",
+    "PanopticSegment26",
+    "PanopticProto26"
+    
 )
