@@ -1513,3 +1513,223 @@ class SemanticSegmentationLoss(nn.Module):
 
         loss_items = {"ce_loss": ce_loss.detach(), "dice_loss": dice_loss.detach(), "aux_loss": aux_loss.detach()}
         return total * preds.shape[0], loss_items
+    
+class PanopticSegmentationLoss(v8SegmentationLoss):
+    """
+    Existing YOLO instance segmentation loss
+    +
+    full-image stuff/thing-gate semantic loss.
+    """
+
+    def __init__(
+        self,
+        model,
+        tal_topk=10,
+        tal_topk2=None,
+    ):
+        super().__init__(model, tal_topk, tal_topk2)
+
+        head = model.model[-1]
+
+        self.n_stuff = head.n_stuff
+        self.n_pan_sem = self.n_stuff + 1
+
+    def semantic_loss(
+        self,
+        logits,
+        target,
+        aux_logits=None,
+    ):
+        """
+        target:
+            0 ... n_stuff-1 -> stuff classes
+            n_stuff        -> THING gate
+            255            -> ignore
+        """
+
+        target = target.to(logits.device).long()
+
+        # Work at prediction resolution.
+        if target.shape[-2:] != logits.shape[-2:]:
+            target_main = F.interpolate(
+                target[:, None].float(),
+                size=logits.shape[-2:],
+                mode="nearest",
+            )[:, 0].long()
+        else:
+            target_main = target
+
+        valid = target_main != 255
+
+        if not valid.any():
+            zero = logits.sum() * 0.0
+            return zero, zero, zero
+
+        # ---------------------------------
+        # Cross entropy
+        # ---------------------------------
+        ce = F.cross_entropy(
+            logits,
+            target_main,
+            ignore_index=255,
+        )
+
+        # ---------------------------------
+        # Multi-class Dice
+        # ---------------------------------
+        probs = F.softmax(
+            logits.float(),
+            dim=1,
+        )
+
+        target_flat = target_main.reshape(-1)
+        valid_flat = target_flat != 255
+
+        target_valid = target_flat[valid_flat]
+
+        pred_valid = (
+            probs
+            .permute(0, 2, 3, 1)
+            .reshape(-1, self.n_pan_sem)
+            [valid_flat]
+        )
+
+        intersection = torch.zeros(
+            self.n_pan_sem,
+            device=logits.device,
+            dtype=torch.float32,
+        )
+
+        intersection.scatter_add_(
+            0,
+            target_valid,
+            pred_valid.gather(
+                1,
+                target_valid[:, None],
+            ).squeeze(1),
+        )
+
+        pred_sum = pred_valid.sum(0)
+
+        target_sum = torch.bincount(
+            target_valid,
+            minlength=self.n_pan_sem,
+        ).float()
+
+        dice = (
+            1.0
+            -
+            (2.0 * intersection + 1.0)
+            /
+            (pred_sum + target_sum + 1.0)
+        ).mean()
+
+        # ---------------------------------
+        # Training-only auxiliary branch
+        # ---------------------------------
+        aux = logits.sum() * 0.0
+
+        if aux_logits is not None:
+            target_aux = F.interpolate(
+                target[:, None].float(),
+                size=aux_logits.shape[-2:],
+                mode="nearest",
+            )[:, 0].long()
+
+            aux = (
+                F.cross_entropy(
+                    aux_logits,
+                    target_aux,
+                    ignore_index=255,
+                )
+                * 0.4
+            )
+
+        return ce, dice, aux
+
+    def loss(self, preds, batch):
+
+        # Existing YOLO box/class/instance-mask losses.
+        loss, items = super().loss(
+            preds,
+            batch,
+        )
+
+        stuff_logits = preds.get(
+            "stuff_logits",
+            None,
+        )
+
+        # one-to-one branch intentionally may not contain it
+        if stuff_logits is None:
+            return loss, items
+
+        target = batch["semantic_mask"]
+
+        ce, dice, aux = self.semantic_loss(
+            stuff_logits,
+            target,
+            preds.get("aux_stuff_logits"),
+        )
+
+        stuff_loss = ce + dice + aux
+
+        bs = stuff_logits.shape[0]
+
+        loss = loss.clone()
+
+        # Existing semantic slot
+        loss[4] = stuff_loss * bs
+
+        items["sem_loss"] = stuff_loss.detach()
+
+        return loss, items
+    
+class PanopticE2ELoss(E2ELoss):
+
+    def __init__(self, model):
+        super().__init__(
+            model,
+            loss_fn=PanopticSegmentationLoss,
+        )
+
+    def __call__(self, preds, batch):
+        preds = self.one2many.parse_output(preds)
+
+        one2many = preds["one2many"]
+        one2one = preds["one2one"]
+
+        loss_o2m, items_o2m = self.one2many.loss(
+            one2many,
+            batch,
+        )
+
+        loss_o2o, items_o2o = self.one2one.loss(
+            one2one,
+            batch,
+        )
+
+        # Semantic/stuff loss comes from shared O2M path.
+        stuff_loss = loss_o2m[4].clone()
+
+        # Don't progressively decay semantic supervision.
+        loss_o2m = loss_o2m.clone()
+        loss_o2o = loss_o2o.clone()
+
+        loss_o2m[4] = 0
+        loss_o2o[4] = 0
+
+        total = (
+            self.o2m * loss_o2m
+            +
+            self.o2o * loss_o2o
+        )
+
+        # Restore semantic loss independently.
+        total[4] = stuff_loss
+
+        items = dict(items_o2o)
+
+        items["sem_loss"] = items_o2m["sem_loss"]
+
+        return total, items    

@@ -100,6 +100,8 @@ from ultralytics.utils.loss import (
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
+    PanopticSegmentationLoss,
+    PanopticE2ELoss
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
@@ -659,7 +661,19 @@ class SegmentationModel(DetectionModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the SegmentationModel."""
-        return E2ELoss(self, v8SegmentationLoss) if getattr(self, "end2end", False) else v8SegmentationLoss(self)
+        if isinstance(
+            self.model[-1],
+            PanopticSegment26,):
+            if getattr(self, "end2end", False):
+                return PanopticE2ELoss(self)
+
+            return PanopticSegmentationLoss(self)
+
+        return (
+            E2ELoss(self, v8SegmentationLoss)
+            if getattr(self, "end2end", False)
+            else v8SegmentationLoss(self)
+        )
 
 
 class SemanticSegmentationModel(BaseModel):
