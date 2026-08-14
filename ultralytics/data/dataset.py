@@ -1295,3 +1295,69 @@ class ClassificationDataset:
             x["msgs"] = msgs  # warnings
             save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
             return samples
+        
+class PanopticDataset(YOLODataset):
+    """
+    YOLO instance labels + paired dense panoptic semantic PNG.
+
+    Instance labels:
+        labels/*.txt
+
+    Dense mask:
+        panoptic_masks/*.png
+    """
+
+    def __init__(
+        self,
+        *args,
+        data=None,
+        **kwargs,
+    ):
+        self.data = data or {}
+
+        super().__init__(
+            *args,
+            data=data,
+            **kwargs,
+        )
+
+        self.panoptic_mask_files = img2label_paths(
+            self.im_files,
+            label_dir=self.data.get(
+                "masks_dir",
+                "panoptic_masks",
+            ),
+            suffix=".png",
+        )
+
+    def get_image_and_label(self, index):
+        label = super().get_image_and_label(index)
+
+        mask_file = self.panoptic_mask_files[index]
+
+        semantic_mask = cv2.imread(
+            mask_file,
+            cv2.IMREAD_GRAYSCALE,
+        )
+
+        if semantic_mask is None:
+            raise FileNotFoundError(
+                f"Missing panoptic mask: {mask_file}"
+            )
+
+        h, w = label["img"].shape[:2]
+
+        if semantic_mask.shape != (h, w):
+            semantic_mask = cv2.resize(
+                semantic_mask,
+                (w, h),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+        label["semantic_mask"] = semantic_mask.astype(
+            np.uint8,
+            copy=False,
+        )
+
+        return label        
+        
